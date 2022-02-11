@@ -46,7 +46,11 @@ fn main() -> Result<()> {
                 }
             } else if metadata.is_file() {
                 if path.ends_with("Cargo.toml") {
-                    kids.push(try_continue!(clean_cargo(&path), path));
+                    kids.push(try_continue!(cargo_clean(&path), path));
+                } else if path.ends_with("Makefile") {
+                    kids.push(try_continue!(make_clean(&path), path));
+                } else if path.ends_with("build.ninja") {
+                    kids.push(try_continue!(ninja_clean(&path), path));
                 }
             } else if !metadata.is_symlink() {
                 unreachable!();
@@ -72,6 +76,7 @@ struct ChildProcess {
 }
 
 impl ChildProcess {
+    #[inline(always)]
     fn try_wait_log(mut self) -> Option<Self> {
         match self.child.try_wait() {
             Err(err) => {
@@ -85,6 +90,7 @@ impl ChildProcess {
             }
         }
     }
+    #[inline(always)]
     fn log_output(self, status: ExitStatus) {
         if !status.success() {
             let mut stderr = String::new();
@@ -96,6 +102,7 @@ impl ChildProcess {
             log_err(&self.path, Error::new(ErrorKind::Other, format!("exit status: {status}, stderr: {stderr}")));
         }
     }
+    #[inline(always)]
     fn wait_log(mut self) {
         match self.child.wait() {
             Err(err) => log_err(&self.path, err),
@@ -105,7 +112,39 @@ impl ChildProcess {
 }
 
 #[inline(always)]
-fn clean_cargo(path: &Path) -> Result<ChildProcess> {
+fn make_clean(path: &Path) -> Result<ChildProcess> {
+    assert!(path.is_absolute());
+    let path = path.parent().unwrap();
+    println!("make clean: {:?}", path);
+    Ok(ChildProcess {
+        child: Command::new("make")
+            .arg("clean")
+            .current_dir(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        path: path.into(),
+    })
+}
+
+#[inline(always)]
+fn ninja_clean(path: &Path) -> Result<ChildProcess> {
+    assert!(path.is_absolute());
+    let path = path.parent().unwrap();
+    println!("ninja clean: {:?}", path);
+    Ok(ChildProcess {
+        child: Command::new("ninja")
+            .arg("clean")
+            .current_dir(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        path: path.into(),
+    })
+}
+
+#[inline(always)]
+fn cargo_clean(path: &Path) -> Result<ChildProcess> {
     assert!(path.is_absolute());
     println!("cargo clean: {:?}", path);
     Ok(ChildProcess {
