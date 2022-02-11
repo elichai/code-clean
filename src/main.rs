@@ -26,7 +26,8 @@ macro_rules! try_continue {
     };
 }
 
-const MAX_KIDS: usize = 8192;
+// We don't want to overwhelm the system with open files
+const MAX_KIDS: usize = 512 + 256;
 
 fn main() -> Result<()> {
     let mut dirs = Vec::with_capacity(512);
