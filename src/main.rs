@@ -1,12 +1,9 @@
-use std::io::Read;
-use std::path::PathBuf;
-use std::process::{Child, ExitStatus, Stdio};
 use std::{
     env::current_dir,
     fs,
-    io::{Error, ErrorKind, Result},
-    path::Path,
-    process::Command,
+    io::{Error, ErrorKind, Read, Result},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
 };
 
 #[inline(always)]
@@ -33,6 +30,7 @@ fn main() -> Result<()> {
     let mut dirs = Vec::with_capacity(512);
     let mut kids = Vec::with_capacity(MAX_KIDS);
     dirs.push(current_dir()?);
+    //. Loop over subdirectories, this is a replacement of recursion. (to prevent stack overflow and smashing)
     while let Some(dir) = dirs.pop() {
         for entry in try_continue!(fs::read_dir(&dir), dir) {
             let entry = try_continue!(entry, dir);
@@ -58,13 +56,14 @@ fn main() -> Result<()> {
 
             if kids.len() == MAX_KIDS {
                 kids = kids.into_iter().filter_map(ChildProcess::try_wait_log).collect();
-                // If none finished, then wait for finish
+                // If no sub-process finished. for the earliest to finish
                 if kids.len() == MAX_KIDS {
-                    kids.pop().unwrap().wait_log();
+                    kids.remove(0).wait_log();
                 }
             }
         }
     }
+    // At the end wait for all currently running sub-processes to finish.
     kids.into_iter().for_each(ChildProcess::wait_log);
     println!("Done");
     Ok(())
