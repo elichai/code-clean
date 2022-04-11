@@ -1,7 +1,7 @@
 use std::{
     env::current_dir,
     fs,
-    io::{Error, ErrorKind, Read, Result},
+    io::{self, Error, ErrorKind, Read, Result, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
 };
@@ -30,6 +30,8 @@ fn main() -> Result<()> {
     let mut dirs = Vec::with_capacity(512);
     let mut kids = Vec::with_capacity(MAX_KIDS);
     dirs.push(current_dir()?);
+    let _stdout = io::stdout();
+    let mut stdout = _stdout.lock();
     //. Loop over subdirectories, this is a replacement of recursion. (to prevent stack overflow and smashing)
     while let Some(dir) = dirs.pop() {
         for entry in try_continue!(fs::read_dir(&dir), dir) {
@@ -38,17 +40,17 @@ fn main() -> Result<()> {
             let metadata = try_continue!(entry.metadata(), path);
             if metadata.is_dir() {
                 if path.ends_with(".git") {
-                    kids.push(try_continue!(git_gc(&path), path));
+                    kids.push(try_continue!(git_gc(&path, &mut stdout), path));
                 } else {
                     dirs.push(path);
                 }
             } else if metadata.is_file() {
                 if path.ends_with("Cargo.toml") {
-                    kids.push(try_continue!(cargo_clean(&path), path));
+                    kids.push(try_continue!(cargo_clean(&path, &mut stdout), path));
                 } else if path.ends_with("Makefile") {
-                    kids.push(try_continue!(make_clean(&path), path));
+                    kids.push(try_continue!(make_clean(&path, &mut stdout), path));
                 } else if path.ends_with("build.ninja") {
-                    kids.push(try_continue!(ninja_clean(&path), path));
+                    kids.push(try_continue!(ninja_clean(&path, &mut stdout), path));
                 }
             } else if !metadata.is_symlink() {
                 unreachable!();
@@ -56,16 +58,17 @@ fn main() -> Result<()> {
 
             if kids.len() == MAX_KIDS {
                 kids = kids.into_iter().filter_map(ChildProcess::try_wait_log).collect();
-                // If no sub-process finished. for the earliest to finish
+                // If no sub-process finished wait for the earliest to finish
                 if kids.len() == MAX_KIDS {
                     kids.remove(0).wait_log();
                 }
             }
         }
     }
+    writeln!(stdout, "Waiting for child processes to finish")?;
     // At the end wait for all currently running sub-processes to finish.
     kids.into_iter().for_each(ChildProcess::wait_log);
-    println!("Done");
+    writeln!(stdout, "Done")?;
     Ok(())
 }
 
@@ -111,10 +114,10 @@ impl ChildProcess {
 }
 
 #[inline(always)]
-fn make_clean(path: &Path) -> Result<ChildProcess> {
+fn make_clean(path: &Path, stdout: &mut impl Write) -> Result<ChildProcess> {
     assert!(path.is_absolute());
     let path = path.parent().unwrap();
-    println!("make clean: {:?}", path);
+    writeln!(stdout, "make clean: {:?}", path)?;
     Ok(ChildProcess {
         child: Command::new("make")
             .arg("clean")
@@ -127,10 +130,10 @@ fn make_clean(path: &Path) -> Result<ChildProcess> {
 }
 
 #[inline(always)]
-fn ninja_clean(path: &Path) -> Result<ChildProcess> {
+fn ninja_clean(path: &Path, stdout: &mut impl Write) -> Result<ChildProcess> {
     assert!(path.is_absolute());
     let path = path.parent().unwrap();
-    println!("ninja clean: {:?}", path);
+    writeln!(stdout, "ninja clean: {:?}", path)?;
     Ok(ChildProcess {
         child: Command::new("ninja")
             .arg("clean")
@@ -143,9 +146,9 @@ fn ninja_clean(path: &Path) -> Result<ChildProcess> {
 }
 
 #[inline(always)]
-fn cargo_clean(path: &Path) -> Result<ChildProcess> {
+fn cargo_clean(path: &Path, stdout: &mut impl Write) -> Result<ChildProcess> {
     assert!(path.is_absolute());
-    println!("cargo clean: {:?}", path);
+    writeln!(stdout, "cargo clean: {:?}", path)?;
     Ok(ChildProcess {
         child: Command::new("cargo")
             .args(["clean", "--manifest-path"])
@@ -158,9 +161,9 @@ fn cargo_clean(path: &Path) -> Result<ChildProcess> {
 }
 
 #[inline(always)]
-fn git_gc(path: &Path) -> Result<ChildProcess> {
+fn git_gc(path: &Path, stdout: &mut impl Write) -> Result<ChildProcess> {
     assert!(path.is_absolute());
-    println!("git gc: {:?}", path);
+    writeln!(stdout, "git gc: {:?}", path)?;
     Ok(ChildProcess {
         child: Command::new("git").arg("gc").current_dir(path).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?,
         path: path.into(),
