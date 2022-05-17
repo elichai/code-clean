@@ -26,6 +26,12 @@ macro_rules! try_continue {
 // We don't want to overwhelm the system with open files
 const MAX_KIDS: usize = 512 + 256;
 
+#[inline(always)]
+fn should_ignore(path: &Path) -> bool {
+    const IGNORE_LIST: &[&str] = &["node_modules"];
+    IGNORE_LIST.iter().any(|&ignore| path.ends_with(ignore))
+}
+
 fn main() -> Result<()> {
     let mut dirs = Vec::with_capacity(512);
     let mut kids = Vec::with_capacity(MAX_KIDS);
@@ -41,7 +47,7 @@ fn main() -> Result<()> {
             if metadata.is_dir() {
                 if path.ends_with(".git") {
                     kids.push(try_continue!(git_gc(&path, &mut stdout), path));
-                } else {
+                } else if !should_ignore(&path) {
                     dirs.push(path);
                 }
             } else if metadata.is_file() {
@@ -53,10 +59,11 @@ fn main() -> Result<()> {
                     kids.push(try_continue!(ninja_clean(&path, &mut stdout), path));
                 }
             } else if !metadata.is_symlink() {
-                unreachable!();
+                panic!("Unknown file type of: {:?}", metadata);
             }
 
             if kids.len() == MAX_KIDS {
+                //TODO: Use https://doc.rust-lang.org/std/vec/struct.Vec.html#method.retain_mut when stable
                 kids = kids.into_iter().filter_map(ChildProcess::try_wait_log).collect();
                 // If no sub-process finished wait for the earliest to finish
                 if kids.len() == MAX_KIDS {
