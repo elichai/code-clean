@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::{
     env::current_dir,
     fs,
@@ -32,50 +33,74 @@ fn should_ignore(path: &Path) -> bool {
     IGNORE_LIST.iter().any(|&ignore| path.ends_with(ignore))
 }
 
+struct ChildrenManager {
+    kids: Vec<ChildProcess>,
+    stdout: io::StdoutLock<'static>,
+}
+
+impl ChildrenManager {
+    #[inline(always)]
+    fn new(cap: usize) -> Self {
+        Self { kids: Vec::with_capacity(cap), stdout: io::stdout().lock() }
+    }
+    #[inline(always)]
+    fn push_wait(&mut self, kid: ChildProcess) {
+        if self.kids.len() == self.kids.capacity() {
+            self.kids.retain_mut(ChildProcess::try_wait_log);
+            // If no sub-process finished wait for the earliest to finish
+            if self.kids.len() == self.kids.capacity() {
+                self.kids.remove(0).wait_log();
+            }
+        }
+        self.kids.push(kid);
+    }
+    #[inline(always)]
+    fn handle_path(&mut self, path: &Path) -> Result<()> {
+        let child = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|file_name| match file_name {
+                "Cargo.toml" => Some(cargo_clean(path, &mut self.stdout)),
+                "Makefile" => Some(make_clean(path, &mut self.stdout)),
+                "build.ninja" => Some(ninja_clean(path, &mut self.stdout)),
+                ".git" => Some(git_gc(path, &mut self.stdout)),
+                _ => None,
+            })
+            .transpose()?;
+        if let Some(child) = child {
+            self.push_wait(child)
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ChildrenManager {
+    fn drop(&mut self) {
+        // Wait on all sub-processes.
+        self.kids.drain(..).for_each(ChildProcess::wait_log);
+    }
+}
+
 fn main() -> Result<()> {
     let mut dirs = Vec::with_capacity(512);
-    let mut kids = Vec::with_capacity(MAX_KIDS);
+    let mut kids_manager = ChildrenManager::new(MAX_KIDS);
     dirs.push(current_dir()?);
-    let _stdout = io::stdout();
-    let mut stdout = _stdout.lock();
     //. Loop over subdirectories, this is a replacement of recursion. (to prevent stack overflow and smashing)
     while let Some(dir) = dirs.pop() {
         for entry in try_continue!(fs::read_dir(&dir), dir) {
             let entry = try_continue!(entry, dir);
             let path = entry.path();
             let metadata = try_continue!(entry.metadata(), path);
-            if metadata.is_dir() {
-                if path.ends_with(".git") {
-                    kids.push(try_continue!(git_gc(&path, &mut stdout), path));
-                } else if !should_ignore(&path) {
-                    dirs.push(path);
-                }
-            } else if metadata.is_file() {
-                if path.ends_with("Cargo.toml") {
-                    kids.push(try_continue!(cargo_clean(&path, &mut stdout), path));
-                } else if path.ends_with("Makefile") {
-                    kids.push(try_continue!(make_clean(&path, &mut stdout), path));
-                } else if path.ends_with("build.ninja") {
-                    kids.push(try_continue!(ninja_clean(&path, &mut stdout), path));
-                }
-            } else if !metadata.is_symlink() {
-                panic!("Unknown file type of: {:?}", metadata);
-            }
-
-            if kids.len() == MAX_KIDS {
-                //TODO: Use https://doc.rust-lang.org/std/vec/struct.Vec.html#method.retain_mut when stable
-                kids = kids.into_iter().filter_map(ChildProcess::try_wait_log).collect();
-                // If no sub-process finished wait for the earliest to finish
-                if kids.len() == MAX_KIDS {
-                    kids.remove(0).wait_log();
-                }
+            try_continue!(kids_manager.handle_path(&path), path);
+            if metadata.is_dir() && !should_ignore(&path) {
+                dirs.push(path);
             }
         }
     }
-    writeln!(stdout, "Waiting for child processes to finish")?;
+    writeln!(kids_manager.stdout, "Waiting for child processes to finish")?;
     // At the end wait for all currently running sub-processes to finish.
-    kids.into_iter().for_each(ChildProcess::wait_log);
-    writeln!(stdout, "Done")?;
+    drop(kids_manager);
+    println!("Done");
     Ok(())
 }
 
@@ -86,24 +111,24 @@ struct ChildProcess {
 
 impl ChildProcess {
     #[inline(always)]
-    fn try_wait_log(mut self) -> Option<Self> {
+    fn try_wait_log(&mut self) -> bool {
         match self.child.try_wait() {
             Err(err) => {
                 log_err(&self.path, err);
-                None
+                false
             }
-            Ok(None) => Some(self),
+            Ok(None) => true,
             Ok(Some(status)) => {
                 self.log_output(status);
-                None
+                false
             }
         }
     }
     #[inline(always)]
-    fn log_output(self, status: ExitStatus) {
+    fn log_output(&mut self, status: ExitStatus) {
         if !status.success() {
             let mut stderr = String::new();
-            if let Some(mut stderr_handler) = self.child.stderr {
+            if let Some(stderr_handler) = &mut self.child.stderr {
                 if let Err(err) = stderr_handler.read_to_string(&mut stderr) {
                     log_err(&self.path, err);
                 }
