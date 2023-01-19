@@ -60,10 +60,11 @@ impl ChildrenManager {
             .file_name()
             .and_then(OsStr::to_str)
             .and_then(|file_name| match file_name {
-                "Cargo.toml" => Some(cargo_clean(path, &mut self.stdout)),
-                "Makefile" => Some(make_clean(path, &mut self.stdout)),
-                "build.ninja" => Some(ninja_clean(path, &mut self.stdout)),
-                ".git" => Some(git_gc(path, &mut self.stdout)),
+                "Cargo.toml" => Some(ChildProcess::new_cargo_clean(path, &mut self.stdout)),
+                "Makefile" => Some(ChildProcess::new_make_clean(path, &mut self.stdout)),
+                "build.ninja" => Some(ChildProcess::new_ninja_clean(path, &mut self.stdout)),
+                "gradlew" => Some(ChildProcess::new_gradlew_clean(path, &mut self.stdout)),
+                ".git" => Some(ChildProcess::new_git_clean(path, &mut self.stdout)),
                 _ => None,
             })
             .transpose()?;
@@ -110,6 +111,37 @@ struct ChildProcess {
 }
 
 impl ChildProcess {
+    fn new_make_clean(path: &Path, stdout: &mut io::StdoutLock<'_>) -> Result<Self> {
+        Self::new("make", &["clean".as_ref()], path, stdout)
+    }
+    fn new_gradlew_clean(path: &Path, stdout: &mut io::StdoutLock<'_>) -> Result<Self> {
+        Self::new("./gradlew", &["clean".as_ref()], path, stdout)
+    }
+    fn new_ninja_clean(path: &Path, stdout: &mut io::StdoutLock<'_>) -> Result<Self> {
+        Self::new("ninja", &["clean".as_ref()], path, stdout)
+    }
+    fn new_cargo_clean(path: &Path, stdout: &mut io::StdoutLock<'_>) -> Result<Self> {
+        Self::new("cargo", &["clean".as_ref(), "--manifest-path".as_ref(), path.as_ref()], path, stdout)
+    }
+    fn new_git_clean(path: &Path, stdout: &mut io::StdoutLock<'_>) -> Result<Self> {
+        Self::new("git", &["gc".as_ref()], path, stdout)
+    }
+
+    fn new(program: &str, args: &[&OsStr], path: &Path, stdout: &mut impl Write) -> Result<Self> {
+        assert!(path.is_absolute());
+        let path = path.parent().unwrap();
+        writeln!(stdout, "{program} {args:?}: {path:?}")?;
+        Ok(ChildProcess {
+            child: Command::new(program)
+                .args(args)
+                .current_dir(path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()?,
+            path: path.into(),
+        })
+    }
+
     #[inline(always)]
     fn try_wait_log(&mut self) -> bool {
         match self.child.try_wait() {
@@ -143,61 +175,4 @@ impl ChildProcess {
             Ok(status) => self.log_output(status),
         }
     }
-}
-
-#[inline(always)]
-fn make_clean(path: &Path, stdout: &mut impl Write) -> Result<ChildProcess> {
-    assert!(path.is_absolute());
-    let path = path.parent().unwrap();
-    writeln!(stdout, "make clean: {:?}", path)?;
-    Ok(ChildProcess {
-        child: Command::new("make")
-            .arg("clean")
-            .current_dir(path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()?,
-        path: path.into(),
-    })
-}
-
-#[inline(always)]
-fn ninja_clean(path: &Path, stdout: &mut impl Write) -> Result<ChildProcess> {
-    assert!(path.is_absolute());
-    let path = path.parent().unwrap();
-    writeln!(stdout, "ninja clean: {:?}", path)?;
-    Ok(ChildProcess {
-        child: Command::new("ninja")
-            .arg("clean")
-            .current_dir(path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()?,
-        path: path.into(),
-    })
-}
-
-#[inline(always)]
-fn cargo_clean(path: &Path, stdout: &mut impl Write) -> Result<ChildProcess> {
-    assert!(path.is_absolute());
-    writeln!(stdout, "cargo clean: {:?}", path)?;
-    Ok(ChildProcess {
-        child: Command::new("cargo")
-            .args(["clean", "--manifest-path"])
-            .arg(path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()?,
-        path: path.into(),
-    })
-}
-
-#[inline(always)]
-fn git_gc(path: &Path, stdout: &mut impl Write) -> Result<ChildProcess> {
-    assert!(path.is_absolute());
-    writeln!(stdout, "git gc: {:?}", path)?;
-    Ok(ChildProcess {
-        child: Command::new("git").arg("gc").current_dir(path).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?,
-        path: path.into(),
-    })
 }
