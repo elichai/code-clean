@@ -44,28 +44,38 @@ impl ChildrenManager {
     #[inline(always)]
     fn push_wait(&mut self, kid: ChildProcess) -> Result<()> {
         if self.kids.len() == self.kids.capacity() {
-            let mut res = Ok(());
-            self.kids.retain_mut(|child| {
-                if res.is_err() {
-                    return true;
-                }
-                match child.try_wait_log(&mut self.stderr) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        res = Err(e);
-                        true
-                    }
-                }
-            });
-            res?;
-            // If no sub-process finished wait for the earliest to finish
-            if self.kids.len() == self.kids.capacity() {
-                self.kids.remove(0).wait_log(&mut self.stderr)?;
-            }
+            self.try_wait_remove()?;
         }
+        // If no sub-process finished wait for the earliest to finish
+        if self.kids.len() == self.kids.capacity() {
+            self.wait_remove()?;
+        }
+
         self.kids.push(kid);
         Ok(())
     }
+
+    #[inline(always)]
+    fn try_wait_remove(&mut self) -> Result<()> {
+        let mut i = 0;
+        while i < self.kids.len() {
+            if self.kids[i].try_wait_log(&mut self.stderr)? {
+                self.kids.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn wait_remove(&mut self) -> Result<()> {
+        match os_wait::wait_on_children(&self.kids) {
+            Err(err) => self.stderr.log_os_err(err),
+            Ok((status, idx)) => self.kids.swap_remove(idx).log_output(status, &mut self.stderr),
+        }
+    }
+
     #[inline(always)]
     fn handle_path(&mut self, path: &Path) -> Result<()> {
         let child = path
@@ -111,6 +121,10 @@ impl StdErrManager {
     #[inline(always)]
     fn log_err(&mut self, path: &impl AsRef<Path>, err: impl std::error::Error) -> Result<()> {
         writeln!(&mut self.stderr, "Error in: {:?} => {}", path.as_ref(), err)
+    }
+    #[inline(always)]
+    fn log_os_err(&mut self, err: impl std::error::Error) -> Result<()> {
+        writeln!(&mut self.stderr, "Operating System Error: {err}")
     }
 
     #[inline(always)]
@@ -197,6 +211,7 @@ impl ChildProcess {
                 .current_dir(path)
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
+                .register_child()
                 .spawn()?,
             path: path.into(),
         })
@@ -204,10 +219,9 @@ impl ChildProcess {
 
     #[inline(always)]
     fn try_wait_log(&mut self, stderr_manager: &mut StdErrManager) -> Result<bool> {
-        match self.child.try_wait() {
-            Err(err) => stderr_manager.log_err(&self.path, err).map(|()| false),
-            Ok(None) => Ok(true),
-            Ok(Some(status)) => self.log_output(status, stderr_manager).map(|()| false),
+        match self.child.try_wait().transpose() {
+            None => Ok(true),
+            Some(res) => self.log_res(stderr_manager, res).map(|()| false),
         }
     }
     #[inline(always)]
@@ -219,10 +233,125 @@ impl ChildProcess {
         }
     }
     #[inline(always)]
-    fn wait_log(mut self, stderr_manager: &mut StdErrManager) -> Result<()> {
-        match self.child.wait() {
+    fn log_res(&mut self, stderr_manager: &mut StdErrManager, res: Result<ExitStatus>) -> Result<()> {
+        match res {
             Err(err) => stderr_manager.log_err(&self.path, err),
             Ok(status) => self.log_output(status, stderr_manager),
         }
+    }
+    #[inline(always)]
+    fn wait_log(mut self, stderr_manager: &mut StdErrManager) -> Result<()> {
+        let res = self.child.wait();
+        self.log_res(stderr_manager, res)
+    }
+}
+
+trait RegisterChild {
+    fn register_child(&mut self) -> &mut Self;
+}
+
+#[cfg(unix)]
+mod os_wait {
+    use crate::{ChildProcess, RegisterChild};
+    use std::ffi::c_int;
+    use std::io::Result;
+    use std::os::unix::prelude::ExitStatusExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::{abort, Command, ExitStatus};
+    use std::sync::Once;
+    #[allow(non_camel_case_types)]
+    type pid_t = i32;
+    extern "C" {
+        fn waitpid(pid: pid_t, wstatus: *mut c_int, options: c_int) -> pid_t;
+        fn getpgrp() -> pid_t;
+    }
+    fn get_pgid() -> pid_t {
+        static mut PGID: pid_t = 0;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| unsafe {
+            PGID = getpgrp();
+            if PGID == -1 {
+                eprintln!("{:?}", std::io::Error::last_os_error());
+                abort();
+            }
+        });
+        unsafe { PGID }
+    }
+
+    impl RegisterChild for Command {
+        #[inline(always)]
+        fn register_child(&mut self) -> &mut Self {
+            self.process_group(get_pgid())
+        }
+    }
+
+    /// Returns the exit status and the index of the child process that exited.
+    #[inline(always)]
+    pub(super) fn wait_on_children(processes: &[ChildProcess]) -> Result<(ExitStatus, usize)> {
+        let mut status: c_int = 0;
+        let pid = match unsafe { waitpid(-get_pgid(), &mut status, 0) } {
+            -1 => return Err(std::io::Error::last_os_error()),
+            pid if pid.is_positive() => pid,
+            _ => abort(),
+        };
+        let index = processes.iter().position(|p| p.child.id() == pid as u32).unwrap();
+        Ok((ExitStatus::from_raw(status), index))
+    }
+}
+
+#[cfg(windows)]
+mod os_wait {
+    use crate::{ChildProcess, RegisterChild};
+    use std::ffi::{c_int, c_ulong};
+    use std::io::Result;
+    use std::os::windows::{io::AsRawHandle, process::ExitStatusExt, raw::HANDLE};
+    use std::process::{Command, ExitStatus};
+    use std::{cmp, ptr};
+
+    impl RegisterChild for Command {
+        #[inline(always)]
+        fn register_child(&mut self) -> &mut Self {
+            self
+        }
+    }
+
+    type DWORD = c_ulong;
+    type BOOL = c_int;
+    type LPDWORD = *mut DWORD;
+
+    const MAXIMUM_WAIT_OBJECTS: usize = 64;
+    const WAIT_OBJECT_0: DWORD = 0;
+    const WAIT_FAILED: DWORD = 0xFFFFFFFF;
+    const INFINITE: DWORD = 0xFFFFFFFF;
+    const FALSE: BOOL = 0;
+    extern "system" {
+        fn WaitForMultipleObjects(
+            n_count: DWORD,
+            lp_handles: *const HANDLE,
+            b_wait_all: BOOL,
+            dw_milliseconds: DWORD,
+        ) -> DWORD;
+        fn GetExitCodeProcess(h_process: HANDLE, lp_exit_code: LPDWORD) -> BOOL;
+    }
+
+    /// Returns the exit status and the index of the child process that exited.
+    #[inline(always)]
+    pub(super) fn wait_on_children(processes: &[ChildProcess]) -> Result<(ExitStatus, usize)> {
+        // Sadly windows doesn't support waiting on more than 64 processes at once.
+        let mut handles = [ptr::null_mut(); MAXIMUM_WAIT_OBJECTS];
+        let size = cmp::min(processes.len(), MAXIMUM_WAIT_OBJECTS);
+        for (i, p) in processes.iter().take(size).enumerate() {
+            handles[i] = p.child.as_raw_handle();
+        }
+        let index = match unsafe { WaitForMultipleObjects(size as DWORD, handles.as_ptr(), FALSE, INFINITE) } {
+            WAIT_FAILED => return Err(std::io::Error::last_os_error()),
+            ret => (ret - WAIT_OBJECT_0) as usize,
+        };
+        let mut status = 0;
+        let handle = processes[index].child.as_raw_handle();
+        if unsafe { GetExitCodeProcess(handle, &mut status) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((ExitStatus::from_raw(status), index))
     }
 }
