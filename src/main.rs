@@ -1,11 +1,12 @@
 use std::ffi::OsStr;
 use std::process::ChildStderr;
 use std::{
-    env::current_dir,
+    env::{self, current_dir},
     fs,
     io::{self, Error, ErrorKind, Read, Result, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
+    str::FromStr,
 };
 
 macro_rules! try_continue {
@@ -131,8 +132,13 @@ impl StdErrManager {
 }
 
 fn main() -> Result<()> {
+    let kids_limit = env::args()
+        .position(|a| a == "-j" || a == "--jobs")
+        .and_then(|pos| env::args().nth(pos + 1).map(|v| usize::from_str(&v).unwrap()))
+        .unwrap_or(MAX_KIDS);
+    println!("Using {kids_limit} jobs");
     let mut dirs = Vec::with_capacity(512);
-    let mut kids_manager = ChildrenManager::new(MAX_KIDS);
+    let mut kids_manager = ChildrenManager::new(kids_limit);
     dirs.push(current_dir()?);
     //. Loop over subdirectories, this is a replacement of recursion. (to prevent stack overflow and smashing)
     while let Some(dir) = dirs.pop() {
