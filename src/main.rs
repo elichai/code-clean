@@ -30,16 +30,22 @@ fn should_ignore(path: &Path) -> bool {
     IGNORE_LIST.iter().any(|&ignore| path.ends_with(ignore))
 }
 
+#[inline(always)]
+fn is_hidden(path: &Path) -> bool {
+    path.file_name().and_then(OsStr::to_str).map(|s| s.starts_with('.')).unwrap_or(false)
+}
+
 struct ChildrenManager {
     kids: Vec<ChildProcess>,
     stdout: io::StdoutLock<'static>,
     stderr: StdErrManager,
+    log_command: bool,
 }
 
 impl ChildrenManager {
     #[inline(always)]
-    fn new(cap: usize) -> Self {
-        Self { kids: Vec::with_capacity(cap), stdout: io::stdout().lock(), stderr: StdErrManager::new() }
+    fn new(cap: usize, log_command: bool) -> Self {
+        Self { kids: Vec::with_capacity(cap), stdout: io::stdout().lock(), stderr: StdErrManager::new(), log_command }
     }
     #[inline(always)]
     fn push_wait(&mut self, kid: ChildProcess) -> Result<()> {
@@ -82,18 +88,72 @@ impl ChildrenManager {
             .file_name()
             .and_then(OsStr::to_str)
             .and_then(|file_name| match file_name {
-                "Cargo.toml" => Some(ChildProcess::new_cargo_clean(path, &mut self.stdout)),
-                "Makefile" => Some(ChildProcess::new_make_clean(path, &mut self.stdout)),
-                "build.ninja" => Some(ChildProcess::new_ninja_clean(path, &mut self.stdout)),
-                "gradlew" => Some(ChildProcess::new_gradlew_clean(path, &mut self.stdout)),
-                ".git" => Some(ChildProcess::new_git_clean(path, &mut self.stdout)),
+                "Cargo.toml" => Some(self.new_child_cargo_clean(path)),
+                "Makefile" => Some(self.new_child_make_clean(path)),
+                "build.ninja" => Some(self.new_child_ninja_clean(path)),
+                "gradlew" => Some(self.new_child_gradlew_clean(path)),
+                ".git" => Some(self.new_child_git_clean(path)),
+                "package.json" => {
+                    self.new_child_node_modules(&path.with_file_name("node_modules")).map(|_| None).transpose()
+                }
                 _ => None,
             })
             .transpose()?;
         if let Some(child) = child {
-            self.push_wait(child)?
+            self.push_wait(child)?;
         }
         Ok(())
+    }
+
+    #[inline(always)]
+    fn print_command(&mut self, program: &str, args: &[&OsStr], path: &Path) -> Result<()> {
+        if !self.log_command {
+            return Ok(());
+        }
+        write!(&mut self.stdout, "[{path}]: {program} ", path = path.display())?;
+        for arg in args.iter().map(|s| s.to_str().expect("Expect valid utf-8")) {
+            write!(&mut self.stdout, "{arg}")?;
+        }
+        writeln!(&mut self.stdout)
+    }
+
+    #[inline(always)]
+    fn new_child_node_modules(&mut self, path: &Path) -> Result<()> {
+        assert!(path.ends_with("node_modules"));
+        // use symlink_metadata to make sure it's a directory and not follow the symlink
+        if !path.exists() || !fs::symlink_metadata(path)?.is_dir() {
+            return Ok(());
+        }
+        if self.log_command {
+            writeln!(&mut self.stdout, "[{path}]: rm -rf ", path = path.display())?;
+        }
+        fs::remove_dir_all(path)
+    }
+
+    #[inline(always)]
+    fn new_child(&mut self, program: &str, args: &[&OsStr], path: &Path) -> Result<ChildProcess> {
+        self.print_command(program, args, path)?;
+        ChildProcess::new(program, args, path)
+    }
+    #[inline(always)]
+    fn new_child_make_clean(&mut self, path: &Path) -> Result<ChildProcess> {
+        self.new_child("make", &["clean".as_ref()], path)
+    }
+    #[inline(always)]
+    fn new_child_gradlew_clean(&mut self, path: &Path) -> Result<ChildProcess> {
+        self.new_child("./gradlew", &["clean".as_ref()], path)
+    }
+    #[inline(always)]
+    fn new_child_ninja_clean(&mut self, path: &Path) -> Result<ChildProcess> {
+        self.new_child("ninja", &["clean".as_ref()], path)
+    }
+    #[inline(always)]
+    fn new_child_cargo_clean(&mut self, path: &Path) -> Result<ChildProcess> {
+        self.new_child("cargo", &["clean".as_ref(), "--manifest-path".as_ref(), path.as_ref()], path)
+    }
+    #[inline(always)]
+    fn new_child_git_clean(&mut self, path: &Path) -> Result<ChildProcess> {
+        self.new_child("git", &["gc".as_ref()], path)
     }
 }
 
@@ -102,7 +162,7 @@ impl Drop for ChildrenManager {
     fn drop(&mut self) {
         // Wait on all sub-processes.
         self.kids.drain(..).for_each(|child| {
-            child.wait_log(&mut self.stderr).expect("Failed to wait on child process while dropping ChildrenManager")
+            child.wait_log(&mut self.stderr).expect("Failed to wait on child process while dropping ChildrenManager");
         });
     }
 }
@@ -134,14 +194,18 @@ impl StdErrManager {
         status: ExitStatus,
         child_stderr: &mut Option<ChildStderr>,
     ) -> Result<()> {
-        self.buf.clear();
+        const IGNORE_LIST: &[&str] = &["No rule to make target"];
 
+        self.buf.clear();
         if let Some(stderr_handler) = child_stderr {
             if let Err(err) = stderr_handler.read_to_string(&mut self.buf) {
-                self.log_err(path, err)?;
+                return self.log_err(path, err);
             }
         }
-        self.log_err(path, Error::new(ErrorKind::Other, format!("exit status: {status}, stderr: {}", self.buf)))
+        if IGNORE_LIST.iter().any(|&s| self.buf.contains(s)) {
+            return Ok(()); // Ignore this error
+        }
+        self.log_err(path, Error::new(ErrorKind::Other, format!("{status}, stderr: {}", self.buf)))
     }
 }
 
@@ -151,8 +215,9 @@ fn main() -> Result<()> {
         .and_then(|pos| env::args().nth(pos + 1).map(|v| usize::from_str(&v).unwrap()))
         .unwrap_or(MAX_KIDS);
     println!("Using {kids_limit} jobs");
+    let is_log_out = env::var("LOG").map(|v| v == "1" || v == "true").unwrap_or(false);
     let mut dirs = Vec::with_capacity(512);
-    let mut kids_manager = ChildrenManager::new(kids_limit);
+    let mut kids_manager = ChildrenManager::new(kids_limit, is_log_out);
     dirs.push(current_dir()?);
     //. Loop over subdirectories, this is a replacement of recursion. (to prevent stack overflow and smashing)
     while let Some(dir) = dirs.pop() {
@@ -161,7 +226,8 @@ fn main() -> Result<()> {
             let path = entry.path();
             let metadata = try_continue!(&mut kids_manager.stderr, entry.metadata(), path);
             try_continue!(&mut kids_manager.stderr, kids_manager.handle_path(&path), path);
-            if metadata.is_dir() && !should_ignore(&path) {
+            // This won't traverse symlinks, as `entry.metadata()` is the same as `symlink_metadata()`.
+            if metadata.is_dir() && !should_ignore(&path) && !is_hidden(&path) {
                 dirs.push(path);
             }
         }
@@ -180,32 +246,10 @@ struct ChildProcess {
 
 impl ChildProcess {
     #[inline(always)]
-    fn new_make_clean(path: &Path, stdout: &mut io::StdoutLock<'_>) -> Result<Self> {
-        Self::new("make", &["clean".as_ref()], path, stdout)
-    }
-    #[inline(always)]
-    fn new_gradlew_clean(path: &Path, stdout: &mut io::StdoutLock<'_>) -> Result<Self> {
-        Self::new("./gradlew", &["clean".as_ref()], path, stdout)
-    }
-    #[inline(always)]
-    fn new_ninja_clean(path: &Path, stdout: &mut io::StdoutLock<'_>) -> Result<Self> {
-        Self::new("ninja", &["clean".as_ref()], path, stdout)
-    }
-    #[inline(always)]
-    fn new_cargo_clean(path: &Path, stdout: &mut io::StdoutLock<'_>) -> Result<Self> {
-        Self::new("cargo", &["clean".as_ref(), "--manifest-path".as_ref(), path.as_ref()], path, stdout)
-    }
-    #[inline(always)]
-    fn new_git_clean(path: &Path, stdout: &mut io::StdoutLock<'_>) -> Result<Self> {
-        Self::new("git", &["gc".as_ref()], path, stdout)
-    }
-
-    #[inline(always)]
-    fn new(program: &str, args: &[&OsStr], path: &Path, stdout: &mut impl Write) -> Result<Self> {
+    fn new(program: &str, args: &[&OsStr], path: &Path) -> Result<Self> {
         assert!(path.is_absolute());
         let path = path.parent().unwrap();
-        writeln!(stdout, "{program} {args:?}: {path:?}")?;
-        Ok(ChildProcess {
+        Ok(Self {
             child: Command::new(program)
                 .args(args)
                 .current_dir(path)
@@ -219,17 +263,17 @@ impl ChildProcess {
 
     #[inline(always)]
     fn try_wait_log(&mut self, stderr_manager: &mut StdErrManager) -> Result<bool> {
-        match self.child.try_wait().transpose() {
-            None => Ok(true),
-            Some(res) => self.log_res(stderr_manager, res).map(|()| false),
-        }
+        self.child
+            .try_wait()
+            .transpose()
+            .map_or_else(|| Ok(false), |res| self.log_res(stderr_manager, res).map(|()| true))
     }
     #[inline(always)]
     fn log_output(&mut self, status: ExitStatus, stderr_manager: &mut StdErrManager) -> Result<()> {
-        if !status.success() {
-            stderr_manager.log_child_stderr(&self.path, status, &mut self.child.stderr)
-        } else {
+        if status.success() {
             Ok(())
+        } else {
+            stderr_manager.log_child_stderr(&self.path, status, &mut self.child.stderr)
         }
     }
     #[inline(always)]
@@ -258,7 +302,7 @@ mod os_wait {
     use std::os::unix::prelude::ExitStatusExt;
     use std::os::unix::process::CommandExt;
     use std::process::{abort, Command, ExitStatus};
-    use std::sync::Once;
+    use std::sync::atomic::{AtomicI32, Ordering};
     #[allow(non_camel_case_types)]
     type pid_t = i32;
     extern "C" {
@@ -266,16 +310,22 @@ mod os_wait {
         fn getpgrp() -> pid_t;
     }
     fn get_pgid() -> pid_t {
-        static mut PGID: pid_t = 0;
-        static INIT: Once = Once::new();
-        INIT.call_once(|| unsafe {
-            PGID = getpgrp();
-            if PGID == -1 {
-                eprintln!("{:?}", std::io::Error::last_os_error());
-                abort();
-            }
-        });
-        unsafe { PGID }
+        static PGID: AtomicI32 = AtomicI32::new(-1);
+        let cur_pgid = PGID.load(Ordering::Relaxed);
+        if cur_pgid != -1 {
+            // Check if we already have a pgid
+            return cur_pgid;
+        }
+        // We don't have a pgid yet, so we need to get one.
+        let pgid = unsafe { getpgrp() };
+        if pgid == -1 {
+            eprintln!("{:?}", std::io::Error::last_os_error());
+            abort();
+        }
+        let last_pgid = PGID.swap(pgid, Ordering::Relaxed);
+        // Make sure that if we raced another thread we got the same pgid.
+        assert!(last_pgid == -1 || last_pgid == cur_pgid);
+        pgid
     }
 
     impl RegisterChild for Command {
@@ -294,7 +344,8 @@ mod os_wait {
             pid if pid.is_positive() => pid,
             _ => abort(),
         };
-        let index = processes.iter().position(|p| p.child.id() == pid as u32).unwrap();
+        let pid_u32 = u32::try_from(pid).expect("pid should fit in u32");
+        let index = processes.iter().position(|p| p.child.id() == pid_u32).unwrap();
         Ok((ExitStatus::from_raw(status), index))
     }
 }
