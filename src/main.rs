@@ -37,6 +37,7 @@ fn is_hidden(path: &Path) -> bool {
 
 struct ChildrenManager {
     kids: Vec<ChildProcess>,
+    max_kids: usize,
     stdout: io::StdoutLock<'static>,
     stderr: StdErrManager,
     log_command: bool,
@@ -45,19 +46,28 @@ struct ChildrenManager {
 impl ChildrenManager {
     #[inline(always)]
     fn new(cap: usize, log_command: bool) -> Self {
-        Self { kids: Vec::with_capacity(cap), stdout: io::stdout().lock(), stderr: StdErrManager::new(), log_command }
+        Self {
+            kids: Vec::with_capacity(cap),
+            max_kids: cap,
+            stdout: io::stdout().lock(),
+            stderr: StdErrManager::new(),
+            log_command,
+        }
     }
     #[inline(always)]
     fn push_wait(&mut self, kid: ChildProcess) -> Result<()> {
-        if self.kids.len() == self.kids.capacity() {
+        // IMPORTANT: Add the child FIRST, before calling wait_remove.
+        // Otherwise, waitpid could return this child's PID before we track it.
+        self.kids.push(kid);
+
+        // Now enforce the limit
+        if self.kids.len() >= self.max_kids {
             self.try_wait_remove()?;
         }
-        // If no sub-process finished wait for the earliest to finish
-        if self.kids.len() == self.kids.capacity() {
+        // If no sub-processes have exited yet, we have to wait for one to exit.
+        if self.kids.len() >= self.max_kids {
             self.wait_remove()?;
         }
-
-        self.kids.push(kid);
         Ok(())
     }
 
