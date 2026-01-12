@@ -357,7 +357,10 @@ mod os_wait {
             _ => abort(),
         };
         let pid_u32 = u32::try_from(pid).expect("pid should fit in u32");
-        let index = processes.iter().position(|p| p.child.id() == pid_u32).unwrap();
+        let index = processes.iter().position(|p| p.child.id() == pid_u32).unwrap_or_else(|| {
+            let pids = processes.iter().map(|p| p.child.id()).collect::<Vec<_>>();
+            panic!("waitpid returned unknown pid: {pid_u32}, known pids: {pids:?}")
+        });
         Ok((ExitStatus::from_raw(status), index))
     }
 }
