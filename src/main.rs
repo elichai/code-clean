@@ -318,13 +318,15 @@ mod os_wait {
         }
         // We don't have a pgid yet, so we need to get one.
         let pgid = unsafe { getpgrp() };
+        // getpgid(), and the BSD-specific getpgrp() return a process group on success.
+        // On error, -1 is returned, and errno is set to indicate the error.
         if pgid == -1 {
             eprintln!("{:?}", std::io::Error::last_os_error());
             abort();
         }
         let last_pgid = PGID.swap(pgid, Ordering::Relaxed);
         // Make sure that if we raced another thread we got the same pgid.
-        assert!(last_pgid == -1 || last_pgid == cur_pgid);
+        assert!(last_pgid == -1 || last_pgid == pgid, "last_pgid: {last_pgid}, pgid: {pgid}");
         pgid
     }
 
@@ -400,7 +402,9 @@ mod os_wait {
         };
         let mut status = 0;
         let handle = processes[index].child.as_raw_handle();
-        if unsafe { GetExitCodeProcess(handle, &mut status) } != 0 {
+        // If the function succeeds, the return value is nonzero.
+        // If the function fails, the return value is zero.
+        if unsafe { GetExitCodeProcess(handle, &mut status) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok((ExitStatus::from_raw(status), index))
