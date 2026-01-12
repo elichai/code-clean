@@ -3,7 +3,7 @@ use std::process::ChildStderr;
 use std::{
     env::{self, current_dir},
     fs,
-    io::{self, Error, ErrorKind, Read, Result, Write},
+    io::{self, Error, Read, Result, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     str::FromStr,
@@ -207,15 +207,15 @@ impl StdErrManager {
         const IGNORE_LIST: &[&str] = &["No rule to make target"];
 
         self.buf.clear();
-        if let Some(stderr_handler) = child_stderr {
-            if let Err(err) = stderr_handler.read_to_string(&mut self.buf) {
-                return self.log_err(path, err);
-            }
+        if let Some(stderr_handler) = child_stderr
+            && let Err(err) = stderr_handler.read_to_string(&mut self.buf)
+        {
+            return self.log_err(path, err);
         }
         if IGNORE_LIST.iter().any(|&s| self.buf.contains(s)) {
             return Ok(()); // Ignore this error
         }
-        self.log_err(path, Error::new(ErrorKind::Other, format!("{status}, stderr: {}", self.buf)))
+        self.log_err(path, Error::other(format!("{status}, stderr: {}", self.buf)))
     }
 }
 
@@ -311,11 +311,11 @@ mod os_wait {
     use std::io::Result;
     use std::os::unix::prelude::ExitStatusExt;
     use std::os::unix::process::CommandExt;
-    use std::process::{abort, Command, ExitStatus};
+    use std::process::{Command, ExitStatus, abort};
     use std::sync::atomic::{AtomicI32, Ordering};
     #[allow(non_camel_case_types)]
     type pid_t = i32;
-    extern "C" {
+    unsafe extern "C" {
         fn waitpid(pid: pid_t, wstatus: *mut c_int, options: c_int) -> pid_t;
         fn getpgrp() -> pid_t;
     }
@@ -366,6 +366,7 @@ mod os_wait {
 }
 
 #[cfg(windows)]
+#[allow(clippy::upper_case_acronyms)]
 mod os_wait {
     use crate::{ChildProcess, RegisterChild};
     use std::ffi::{c_int, c_ulong};
@@ -390,7 +391,7 @@ mod os_wait {
     const WAIT_FAILED: DWORD = 0xFFFFFFFF;
     const INFINITE: DWORD = 0xFFFFFFFF;
     const FALSE: BOOL = 0;
-    extern "system" {
+    unsafe extern "system" {
         fn WaitForMultipleObjects(
             n_count: DWORD,
             lp_handles: *const HANDLE,
